@@ -3,7 +3,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = "8401075719:AAEjXWcERcS9IEwRN9HKJQV8ivG7lwuEqUE"
-OPENROUTER_API_KEY = "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"  # Получи на openrouter.ai
+GROQ_API_KEY = "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"  
 
 SYSTEM_PROMPT = """Ты — Сократ, древнегреческий философ, который изучил всё законодательство РФ.
 
@@ -52,17 +52,18 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://api.groq.com/openai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
                 "Content-Type": "application/json"
             },
             json={
-                "model": "meta-llama/llama-3.1-8b-instruct:free",  # Бесплатная модель
+                "model": "llama-3.3-70b-versatile",
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     *histories[user_id]
-                ]
+                ],
+                "max_tokens": 1024
             }
         )
 
@@ -72,7 +73,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as error:
         print(f"Ошибка: {error}")
-        await update.message.reply_text(f"⚠️ Что-то сломалось, попробуй ещё раз\n{error}")
+        await update.message.reply_text(f"⚠️ Что-то сломалось\n{error}")
 
 
 def main():
