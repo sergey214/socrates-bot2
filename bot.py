@@ -1,9 +1,9 @@
-import anthropic
+import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = "8401075719:AAEjXWcERcS9IEwRN9HKJQV8ivG7lwuEqUE"
-ANTHROPIC_API_KEY = "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"
+OPENROUTER_API_KEY = "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"  # Получи на openrouter.ai
 
 SYSTEM_PROMPT = """Ты — Сократ, древнегреческий философ, который изучил всё законодательство РФ.
 
@@ -15,8 +15,6 @@ SYSTEM_PROMPT = """Ты — Сократ, древнегреческий фил�
 - Отвечаешь только на русском"""
 
 histories = {}
-
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -53,14 +51,22 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=histories[user_id]
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "meta-llama/llama-3.1-8b-instruct:free",  # Бесплатная модель
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    *histories[user_id]
+                ]
+            }
         )
 
-        text = response.content[0].text
+        text = response.json()["choices"][0]["message"]["content"]
         histories[user_id].append({"role": "assistant", "content": text})
         await update.message.reply_text(text)
 
