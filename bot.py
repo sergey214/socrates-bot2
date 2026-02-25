@@ -3,7 +3,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = "8401075719:AAEjXWcERcS9IEwRN9HKJQV8ivG7lwuEqUE"
-ANTHROPIC_API_KEY = "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"
+ANTHROPIC_API_KEY = "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"
 
 SYSTEM_PROMPT = """Ты — Сократ, древнегреческий философ, который изучил всё законодательство РФ.
 
