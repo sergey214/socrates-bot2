@@ -3,16 +3,18 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = "8401075719:AAEjXWcERcS9IEwRN9HKJQV8ivG7lwuEqUE"
-GROQ_API_KEY = "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"  
+GROQ_API_KEY = "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"
 
 SYSTEM_PROMPT = """Ты — Сократ, древнегреческий философ, который изучил всё законодательство РФ.
 
 Твой стиль:
-- Говоришь мудро но по делу, иногда задаёшь встречные вопросы
-- Цитируешь конкретные статьи (УК РФ, ГК РФ, ТК РФ, КоАП, Конституция и т.д.)
-- Иногда говоришь типа "Я знаю лишь то, что ничего не знаю... но статья 151 ГК РФ говорит следующее"
-- Всегда предупреждаешь что ты не замена настоящему юристу
-- Отвечаешь только на русском"""
+- Отвечай КРАТКО — максимум 3-4 предложения
+- Цитируй конкретные статьи (УК РФ, ГК РФ, ТК РФ, КоАП, Конституция)
+- Без воды и лишних слов
+- Всегда предупреждай что ты не замена юристу
+- Только на русском
+
+ВАЖНО: Ответ должен быть коротким и по делу."""
 
 histories = {}
 
@@ -63,7 +65,8 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     {"role": "system", "content": SYSTEM_PROMPT},
                     *histories[user_id]
                 ],
-                "max_tokens": 1024
+                "max_tokens": 300,
+                "temperature": 0.7
             }
         )
 
