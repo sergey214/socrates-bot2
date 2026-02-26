@@ -1,84 +1,56 @@
+import httpx
 import os
+import asyncio
+import base64
+import time
+from collections import defaultdict
 from dotenv import load_dotenv
-import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-import logging
-from functools import wraps
-from time import time
-
-# Загрузка токенов из .env
-load_dotenv()
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-# Проверка что токены есть
-if not all([8401075719:AAEjXWcERcS9IEwRN9HKJQV8ivG7lwuEqUE, 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]):
-    raise ValueError("❌ Токены не найдены! Создай .env файл")
-
-# Логирование
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes
 )
-logger = logging.getLogger(__name__)
 
-# УЛУЧШЕННЫЙ ПРОМПТ
-SYSTEM_PROMPT = """Ты — Сократ, древнегреческий философ и эксперт по законодательству РФ.
+# ──────────────────────────────────────────
+# КОНФИГ — читаем из .env файла
+# ──────────────────────────────────────────
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 
-ПРАВИЛА ОТВЕТОВ:
-1. Всегда цитируй КОНКРЕТНЫЕ статьи с номерами (например: "Статья 151 ГК РФ гласит...")
-2. Давай практические советы и пошаговые инструкции
-3. Предупреждай о сроках (исковая давность, обжалование и т.д.)
-4. Отвечай кратко но полно - 3-5 предложений
-5. Используй философский стиль Сократа, но без воды
-6. ОБЯЗАТЕЛЬНО напоминай что ты не заменяешь реального юриста
+if not TELEGRAM_TOKEN or not GROQ_API_KEY:
+    raise ValueError("Нет токенов! Создай .env файл (см. .env.example)")
 
-СТРУКТУРА ОТВЕТА:
-- Краткий ответ (да/нет/возможно)
-- Ссылка на закон (статья + кодекс)
-- Практический совет
-- Предупреждение о сроках (если актуально)
+# ──────────────────────────────────────────
+# СИСТЕМНЫЙ ПРОМПТ
+# ──────────────────────────────────────────
+SYSTEM_PROMPT = """Ты — Сократ, древнегреческий философ, который изучил всё законодательство РФ.
 
-ВАЖНО: Если не знаешь точно - скажи это прямо. Лучше признать незнание, чем дать неверный совет.
+Твой стиль:
+- Отвечай КРАТКО — максимум 3-4 предложения
+- Цитируй конкретные статьи (УК РФ, ГК РФ, ТК РФ, КоАП, Конституция)
+- Без воды и лишних слов
+- Всегда предупреждай что ты не замена юристу
+- Только на русском
 
-Отвечай только на русском."""
+ВАЖНО: Ответ должен быть коротким и по делу."""
 
-histories = {}
-user_last_request = {}
-RATE_LIMIT = 3  # секунды между запросами
+# ──────────────────────────────────────────
+# ХРАНИЛИЩЕ (история + статистика)
+# ──────────────────────────────────────────
+histories: dict[int, list]  = defaultdict(list)
+stats:     dict[int, dict]  = defaultdict(lambda: {"questions": 0, "joined": time.strftime("%d.%m.%Y")})
+user_last_request: dict[int, float] = defaultdict(float)
 
-# Rate limiting
-def rate_limit(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        now = time()
-        
-        if user_id in user_last_request:
-            if now - user_last_request[user_id] < RATE_LIMIT:
-                await update.message.reply_text(
-                    "⚠️ Подожди немного перед следующим вопросом.\n"
-                    "Это защита от спама."
-                )
-                return
-        
-        user_last_request[user_id] = now
-        return await func(update, context)
-    
-    return wrapper
+RATE_LIMIT_SECONDS = 3   # пауза между запросами
+MAX_HISTORY        = 10  # сколько сообщений помним
 
-
-def get_ai_response(messages, use_web_search=False):
-    """Запрос к Groq с опциональным веб-поиском"""
-    try:
-        # Базовый запрос
-        response = requests.post(
+# ──────────────────────────────────────────
+# AI — асинхронный запрос (не блокирует бот)
+# ──────────────────────────────────────────
+async def get_ai_response(messages: list[dict], max_tokens: int = 350) -> str:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -87,296 +59,334 @@ def get_ai_response(messages, use_web_search=False):
             json={
                 "model": "llama-3.3-70b-versatile",
                 "messages": messages,
-                "max_tokens": 500,
-                "temperature": 0.3  # Низкая температура для точности
-            },
-            timeout=30
+                "max_tokens": max_tokens,
+                "temperature": 0.7
+            }
         )
-        
-        if response.status_code != 200:
-            logger.error(f"Groq API error: {response.status_code} - {response.text}")
-            return None
-        
+        response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
-    
-    except Exception as error:
-        logger.error(f"AI request failed: {error}")
-        return None
 
 
+async def transcribe_audio(file_path: str) -> str:
+    """Whisper через Groq — распознаём голос"""
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        with open(file_path, "rb") as f:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": ("audio.ogg", f, "audio/ogg")},
+                data={"model": "whisper-large-v3", "language": "ru"}
+            )
+        response.raise_for_status()
+        return response.json()["text"]
+
+
+# ──────────────────────────────────────────
+# УТИЛИТЫ
+# ──────────────────────────────────────────
+def rate_limit_check(user_id: int) -> bool:
+    """True — можно отвечать, False — слишком быстро"""
+    now = time.time()
+    if now - user_last_request[user_id] < RATE_LIMIT_SECONDS:
+        return False
+    user_last_request[user_id] = now
+    return True
+
+
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Поиск по кодексу",  callback_data="search")],
+        [InlineKeyboardButton("📄 Анализ документа",  callback_data="doc_help")],
+        [InlineKeyboardButton("📊 Моя статистика",    callback_data="my_stats")],
+        [InlineKeyboardButton("🗑️ Очистить историю",  callback_data="clear")],
+    ])
+
+
+def read_document_text(path: str, filename: str) -> str:
+    """Читаем TXT и PDF"""
+    if filename.lower().endswith(".pdf"):
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(path)
+            return " ".join(p.extract_text() or "" for p in reader.pages)[:4000]
+        except ImportError:
+            return "[PDF: установи pypdf: pip install pypdf]"
+    else:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()[:4000]
+
+
+# ──────────────────────────────────────────
+# КОМАНДЫ
+# ──────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "Аноним"
-    
-    logger.info(f"User {user_id} (@{username}) started bot")
-    
-    keyboard = [
-        [InlineKeyboardButton("🔍 Поиск статьи", callback_data="search")],
-        [InlineKeyboardButton("📄 Анализ документа", callback_data="doc_help")],
-        [InlineKeyboardButton("💡 Примеры вопросов", callback_data="examples")],
-        [InlineKeyboardButton("🗑️ Очистить историю", callback_data="clear")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
+    user = update.effective_user
+    stats[user.id]  # создаём запись если нет
     await update.message.reply_text(
-        "🏛️ **Привет! Я Сократ — твой юридический помощник**\n\n"
-        "Я помогу разобраться в законах РФ:\n"
-        "• Отвечаю на вопросы по праву\n"
-        "• Цитирую конкретные статьи\n"
-        "• Даю практические советы\n"
-        "• Анализирую документы\n"
+        f"🏛️ Привет, {user.first_name}! Я Сократ, но шарю в законах РФ\n\n"
+        "Что умею:\n"
+        "• Отвечаю на вопросы по закону ⚖️\n"
+        "• Ищу статьи в УК/ГК/ТК/КоАП\n"
+        "• Анализирую документы (PDF/TXT) 📄\n"
+        "• Анализирую фото документов 📸\n"
         "• Понимаю голосовые сообщения 🎤\n\n"
-        "⚖️ Просто задай вопрос!\n\n"
-        "⚠️ Помни: я не заменяю реального юриста",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
+        "Просто пиши или говори вопрос!",
+        reply_markup=main_keyboard()
     )
 
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 Примеры вопросов:\n\n"
+        "• Что будет за кражу до 2500 рублей?\n"
+        "• Могут ли уволить на больничном?\n"
+        "• Какой срок исковой давности по кредиту?\n"
+        "• Что такое самозащита по ГК РФ?\n"
+        "• Штраф за превышение скорости на 40 км/ч?\n\n"
+        "Или отправь документ/фото для анализа."
+    )
+
+
+# ──────────────────────────────────────────
+# КНОПКИ
+# ──────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    
+
     if query.data == "clear":
-        histories[user_id] = []
-        logger.info(f"User {user_id} cleared history")
-        await query.edit_message_text("🗑️ История очищена! Можем начать заново.")
-        
+        histories[user_id].clear()
+        await query.edit_message_text("🗑️ История очищена!", reply_markup=main_keyboard())
+
     elif query.data == "search":
         await query.edit_message_text(
-            "🔍 **Поиск по кодексам**\n\n"
-            "Напиши что ищешь:\n\n"
-            "**Примеры:**\n"
+            "🔍 Поиск по кодексам\n\n"
+            "Напиши что ищешь, например:\n"
             "• УК РФ статья 228\n"
-            "• ГК РФ возмещение морального вреда\n"
-            "• ТК РФ увольнение по собственному\n"
-            "• КоАП штраф за превышение скорости\n"
-            "• Конституция РФ свобода слова\n\n"
-            "Я найду нужные статьи и объясню их."
+            "• ГК РФ возмещение ущерба\n"
+            "• ТК РФ увольнение\n"
+            "• КоАП превышение скорости",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back")]])
         )
-        
+
     elif query.data == "doc_help":
         await query.edit_message_text(
-            "📄 **Анализ документов**\n\n"
-            "Отправь документ (TXT/PDF/фото) и напиши что проверить:\n\n"
-            "**Примеры:**\n"
-            "• Проверь договор на подводные камни\n"
-            "• Есть ли незаконные условия?\n"
-            "• Правильно ли составлена жалоба?\n"
-            "• Какие риски в этом контракте?\n\n"
-            "Я проанализирую и укажу на проблемы."
+            "📄 Анализ документов\n\n"
+            "Отправь PDF или TXT файл, я:\n"
+            "• Найду подводные камни\n"
+            "• Укажу на незаконные пункты\n"
+            "• Дам рекомендации\n\n"
+            "Или отправь фото — распознаю текст 📸",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back")]])
         )
-    
-    elif query.data == "examples":
+
+    elif query.data == "my_stats":
+        s = stats[user_id]
         await query.edit_message_text(
-            "💡 **Примеры вопросов:**\n\n"
-            "**Трудовое право:**\n"
-            "• Меня уволили без предупреждения — законно?\n"
-            "• Не выплатили зарплату, что делать?\n"
-            "• Могу ли я уйти в отпуск когда хочу?\n\n"
-            "**Гражданское право:**\n"
-            "• Сосед затопил квартиру — как взыскать?\n"
-            "• Магазин не вернул деньги за брак\n"
-            "• Как составить претензию?\n\n"
-            "**Административное:**\n"
-            "• Штраф ГАИ — как оспорить?\n"
-            "• Незаконная парковка — что грозит?\n\n"
-            "**Уголовное:**\n"
-            "• Что грозит за драку?\n"
-            "• Клевета — это уголовное?\n\n"
-            "Просто задай свой вопрос!"
+            f"📊 Твоя статистика:\n\n"
+            f"❓ Задано вопросов: {s['questions']}\n"
+            f"📅 Со мной с: {s['joined']}\n"
+            f"💬 Сообщений в памяти: {len(histories[user_id])}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back")]])
+        )
+
+    elif query.data == "back":
+        await query.edit_message_text(
+            "🏛️ Главное меню\n\nЧем могу помочь?",
+            reply_markup=main_keyboard()
         )
 
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка голосовых"""
-    user_id = update.effective_user.id
-    
-    await update.message.reply_text("🎤 Слушаю и транскрибирую...")
-    
-    try:
-        voice_file = await update.message.voice.get_file()
-        voice_path = f"/tmp/voice_{user_id}.ogg"
-        await voice_file.download_to_drive(voice_path)
-        
-        # Транскрибация через Groq Whisper
-        with open(voice_path, "rb") as f:
-            transcribe_response = requests.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                files={"file": f},
-                data={"model": "whisper-large-v3", "language": "ru"}
-            )
-        
-        if transcribe_response.status_code != 200:
-            await update.message.reply_text("❌ Не смог распознать. Попробуй ещё раз")
-            return
-        
-        text = transcribe_response.json()["text"]
-        logger.info(f"User {user_id} voice: {text[:100]}")
-        
-        await update.message.reply_text(f"📝 Ты сказал:\n_{text}_\n\nОтвечаю...", parse_mode='Markdown')
-        
-        # Обрабатываем как текст
-        update.message.text = text
-        await reply(update, context)
-        
-        os.remove(voice_path)
-        
-    except Exception as error:
-        logger.error(f"Voice error for user {user_id}: {error}")
-        await update.message.reply_text(f"⚠️ Ошибка распознавания: {error}")
-
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Анализ документов"""
-    user_id = update.effective_user.id
-    
-    await update.message.reply_text("📄 Анализирую документ...")
-    
-    try:
-        doc = update.message.document
-        doc_file = await doc.get_file()
-        doc_path = f"/tmp/doc_{user_id}_{doc.file_name}"
-        await doc_file.download_to_drive(doc_path)
-        
-        # Читаем текст
-        try:
-            with open(doc_path, "r", encoding="utf-8") as f:
-                doc_text = f.read()[:4000]  # первые 4000 символов
-        except:
-            # Если не UTF-8, пробуем другую кодировку
-            with open(doc_path, "r", encoding="cp1251") as f:
-                doc_text = f.read()[:4000]
-        
-        logger.info(f"User {user_id} uploaded document: {doc.file_name}")
-        
-        # Анализируем
-        analysis_prompt = f"""Проанализируй этот документ как опытный юрист РФ:
-
-{doc_text}
-
-Найди и укажи:
-1. Подводные камни и риски (статьи законов)
-2. Незаконные или сомнительные условия (с номерами статей)
-3. Что нужно исправить или добавить
-4. Практические советы
-
-Ответ структурированный и конкретный."""
-
-        result = get_ai_response([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": analysis_prompt}
-        ])
-        
-        if result:
-            await update.message.reply_text(
-                f"📋 **Анализ документа:**\n\n{result}\n\n"
-                f"⚠️ Это предварительный анализ. Для юридической силы обратись к адвокату.",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text("❌ Не смог проанализировать. Попробуй позже")
-        
-        os.remove(doc_path)
-        
-    except Exception as error:
-        logger.error(f"Document error for user {user_id}: {error}")
-        await update.message.reply_text(f"⚠️ Ошибка обработки: {error}")
-
-
-@rate_limit
+# ──────────────────────────────────────────
+# ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА
+# ──────────────────────────────────────────
 async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "Аноним"
+    user_id  = update.effective_user.id
     question = update.message.text
-    
-    logger.info(f"User {user_id} (@{username}) asked: {question[:100]}")
-    
-    if user_id not in histories:
-        histories[user_id] = []
-    
+
+    # Rate limit
+    if not rate_limit_check(user_id):
+        await update.message.reply_text("⏳ Не торопись, подожди пару секунд!")
+        return
+
+    # Обновляем историю
     histories[user_id].append({"role": "user", "content": question})
-    
-    # Оставляем только последние 6 сообщений (3 пары)
-    if len(histories[user_id]) > 6:
-        histories[user_id] = histories[user_id][-6:]
-    
+    if len(histories[user_id]) > MAX_HISTORY:
+        histories[user_id] = histories[user_id][-MAX_HISTORY:]
+
+    stats[user_id]["questions"] += 1
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    
+
     try:
-        # Проверяем нужен ли веб-поиск
-        search_keywords = ["новый закон", "изменения", "2024", "2025", "2026", "последние", "актуальный"]
-        needs_web_search = any(keyword in question.lower() for keyword in search_keywords)
-        
-        if needs_web_search:
-            await update.message.reply_text(
-                "🔍 Вижу что вопрос про актуальные изменения. "
-                "Ищу свежую информацию...\n\n"
-                "⚠️ Для самых точных данных всегда проверяй на официальных сайтах "
-                "(consultant.ru, pravo.gov.ru)"
-            )
-        
-        # Запрос к AI
-        text = get_ai_response([
+        text = await get_ai_response([
             {"role": "system", "content": SYSTEM_PROMPT},
             *histories[user_id]
         ])
-        
-        if not text:
-            await update.message.reply_text(
-                "⚠️ Не смог получить ответ от AI. Попробуй:\n"
-                "• Переформулировать вопрос\n"
-                "• Задать его через минуту\n"
-                "• Написать короче"
-            )
-            return
-        
         histories[user_id].append({"role": "assistant", "content": text})
-        
-        # Добавляем кнопки для полезных действий
-        keyboard = [
-            [InlineKeyboardButton("🔄 Задать новый вопрос", callback_data="clear")],
-            [InlineKeyboardButton("💡 Примеры вопросов", callback_data="examples")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            text,
-            reply_markup=reply_markup
-        )
-        
-        logger.info(f"User {user_id} got response: {text[:100]}")
-        
+
+        # Кнопки после ответа
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Уточнить вопрос", callback_data="search")],
+            [InlineKeyboardButton("🏠 Меню",            callback_data="back")],
+        ])
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            await update.message.reply_text("⏳ API перегружен, подожди минуту и спроси снова.")
+        else:
+            await update.message.reply_text(f"⚠️ Ошибка API: {e.response.status_code}")
     except Exception as error:
-        logger.error(f"Reply error for user {user_id}: {error}")
-        await update.message.reply_text(
-            f"⚠️ Произошла ошибка.\n\n"
-            f"Попробуй:\n"
-            f"• Переформулировать вопрос\n"
-            f"• Задать его через минуту\n"
-            f"• Написать /start для перезапуска"
+        print(f"Ошибка reply: {error}")
+        await update.message.reply_text("⚠️ Что-то пошло не так, попробуй позже.")
+
+
+# ──────────────────────────────────────────
+# ГОЛОСОВЫЕ СООБЩЕНИЯ
+# ──────────────────────────────────────────
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not rate_limit_check(update.effective_user.id):
+        await update.message.reply_text("⏳ Не торопись!")
+        return
+
+    msg = await update.message.reply_text("🎤 Транскрибирую...")
+
+    try:
+        voice_file = await update.message.voice.get_file()
+        voice_path = f"/tmp/voice_{update.effective_user.id}.ogg"
+        await voice_file.download_to_drive(voice_path)
+
+        text = await transcribe_audio(voice_path)
+        os.remove(voice_path)
+
+        await msg.edit_text(f"📝 Ты сказал: *{text}*\n\nОтвечаю...", parse_mode="Markdown")
+
+        # Подменяем текст и вызываем основной обработчик
+        update.message.text = text
+        await reply(update, context)
+
+    except Exception as error:
+        print(f"Ошибка голоса: {error}")
+        await msg.edit_text(f"⚠️ Не смог распознать голос: {error}")
+
+
+# ──────────────────────────────────────────
+# ДОКУМЕНТЫ
+# ──────────────────────────────────────────
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("📄 Читаю документ...")
+
+    try:
+        doc      = update.message.document
+        doc_file = await doc.get_file()
+        doc_path = f"/tmp/doc_{update.effective_user.id}_{doc.file_name}"
+        await doc_file.download_to_drive(doc_path)
+
+        doc_text = read_document_text(doc_path, doc.file_name)
+        os.remove(doc_path)
+
+        if not doc_text.strip():
+            await msg.edit_text("⚠️ Не смог прочитать текст из документа.")
+            return
+
+        await msg.edit_text("🔍 Анализирую...")
+
+        analysis_prompt = (
+            f"Проанализируй этот документ как юрист:\n\n{doc_text}\n\n"
+            "Найди: 1) Риски и подводные камни 2) Незаконные пункты 3) Что улучшить. Ответ КРАТКО."
         )
 
+        result = await get_ai_response([
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": analysis_prompt}
+        ], max_tokens=500)
 
+        await msg.edit_text(f"📋 Анализ документа:\n\n{result}")
+
+    except Exception as error:
+        print(f"Ошибка документа: {error}")
+        await msg.edit_text(f"⚠️ Ошибка при чтении: {error}")
+
+
+# ──────────────────────────────────────────
+# ФОТО — Vision через Groq
+# ──────────────────────────────────────────
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("📸 Распознаю текст на фото...")
+
+    try:
+        photo      = update.message.photo[-1]
+        photo_file = await photo.get_file()
+        photo_path = f"/tmp/photo_{update.effective_user.id}.jpg"
+        await photo_file.download_to_drive(photo_path)
+
+        with open(photo_path, "rb") as f:
+            image_b64 = base64.b64encode(f.read()).decode()
+        os.remove(photo_path)
+
+        # Groq Vision
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Ты юрист. Извлеки весь текст с фото и проанализируй его: "
+                                    "найди риски, незаконные пункты, дай рекомендации. "
+                                    "Если это не документ — скажи об этом. Отвечай на русском."
+                                )
+                            }
+                        ]
+                    }],
+                    "max_tokens": 500
+                }
+            )
+            response.raise_for_status()
+            result = response.json()["choices"][0]["message"]["content"]
+
+        await msg.edit_text(f"📋 Анализ фото:\n\n{result}")
+
+    except httpx.HTTPStatusError as e:
+        # Если Vision модель недоступна — сообщаем пользователю
+        await msg.edit_text(
+            "📸 Vision временно недоступен.\n\n"
+            "Отправь документ в формате PDF или TXT — разберу точнее!"
+        )
+    except Exception as error:
+        print(f"Ошибка фото: {error}")
+        await msg.edit_text(f"⚠️ Ошибка: {error}")
+
+
+# ──────────────────────────────────────────
+# ЗАПУСК
+# ──────────────────────────────────────────
 def main():
-    logger.info("🚀 Starting Sokrat bot...")
-    
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    
-    # Обработчики
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
-    
-    logger.info("✅ Sokrat bot started successfully!")
-    print("✅ Сократ запущен с улучшениями!")
-    print("📝 Логи сохраняются в bot.log")
-    
-    app.run_polling()
+    bot = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    bot.add_handler(CommandHandler("start", start))
+    bot.add_handler(CommandHandler("help",  help_cmd))
+    bot.add_handler(CallbackQueryHandler(button_handler))
+    bot.add_handler(MessageHandler(filters.VOICE,        handle_voice))
+    bot.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    bot.add_handler(MessageHandler(filters.PHOTO,        handle_photo))
+    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
+
+    print("✅ Сократ запущен!")
+    bot.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
