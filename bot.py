@@ -233,10 +233,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=keyboard)
 
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
-            await update.message.reply_text("⏳ Слишком много запросов, подожди минуту.")
-        else:
-            await update.message.reply_text(f"⚠️ Ошибка API: {e.response.status_code}")
+        await update.message.reply_text(f"⚠️ Ошибка {e.response.status_code}:\n{e.response.text[:500]}")
     except Exception as error:
         print(f"Ошибка reply: {error}")
         await update.message.reply_text("⚠️ Что-то пошло не так, попробуй позже.")
