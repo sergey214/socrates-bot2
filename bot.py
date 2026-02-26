@@ -12,13 +12,11 @@ from telegram.ext import (
 # ──────────────────────────────────────────
 # КОНФИГ — читаем из Railway Variables
 # ──────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("Нет токенов! Добавь TELEGRAM_TOKEN и GEMINI_API_KEY в Railway Variables")
-
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+if not TELEGRAM_TOKEN or not MISTRAL_API_KEY:
+    raise ValueError("Нет токенов! Добавь TELEGRAM_TOKEN и MISTRAL_API_KEY в Railway Variables")
 
 # ──────────────────────────────────────────
 # СИСТЕМНЫЙ ПРОМПТ
@@ -30,7 +28,7 @@ SYSTEM_PROMPT = """Ты — Сократ, древнегреческий фил�
 - Цитируй конкретные статьи (УК РФ, ГК РФ, ТК РФ, КоАП, Конституция)
 - Без воды и лишних слов
 - Всегда предупреждай что ты не замена юристу
-- Только на русском языке, никаких других языков!
+- ТОЛЬКО на русском языке, никаких других языков!
 
 ВАЖНО: Ответ должен быть коротким и по делу. ТОЛЬКО РУССКИЙ ЯЗЫК."""
 
@@ -45,50 +43,28 @@ RATE_LIMIT_SECONDS = 3
 MAX_HISTORY        = 10
 
 # ──────────────────────────────────────────
-# AI — Gemini
+# AI — Mistral
 # ──────────────────────────────────────────
 async def get_ai_response(messages: list[dict]) -> str:
-    contents = []
-    for msg in messages:
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append({
-            "role": role,
-            "parts": [{"text": msg["content"]}]
-        })
-
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
-            GEMINI_URL,
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {MISTRAL_API_KEY}",
+                "Content-Type": "application/json"
+            },
             json={
-                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                "contents": contents,
-                "generationConfig": {
-                    "maxOutputTokens": 350,
-                    "temperature": 0.7
-                }
+                "model": "mistral-small-latest",
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    *messages
+                ],
+                "max_tokens": 350,
+                "temperature": 0.7
             }
         )
         response.raise_for_status()
-        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-
-async def analyze_image_gemini(image_b64: str) -> str:
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        response = await client.post(
-            GEMINI_URL,
-            json={
-                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                "contents": [{
-                    "role": "user",
-                    "parts": [
-                        {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
-                        {"text": "Извлеки текст с фото и проанализируй как юрист: найди риски, незаконные пункты, дай рекомендации. Только русский язык."}
-                    ]
-                }]
-            }
-        )
-        response.raise_for_status()
-        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return response.json()["choices"][0]["message"]["content"]
 
 
 # ──────────────────────────────────────────
@@ -136,7 +112,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Отвечаю на вопросы по закону ⚖️\n"
         "• Ищу статьи в УК/ГК/ТК/КоАП\n"
         "• Анализирую документы (PDF/TXT) 📄\n"
-        "• Анализирую фото документов 📸\n"
         "• Понимаю голосовые сообщения 🎤\n\n"
         "Просто пиши или говори вопрос!",
         reply_markup=main_keyboard()
@@ -150,7 +125,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Могут ли уволить на больничном?\n"
         "• Какой срок исковой давности по кредиту?\n"
         "• Штраф за превышение скорости на 40 км/ч?\n\n"
-        "Или отправь документ/фото для анализа."
+        "Или отправь документ для анализа."
     )
 
 
@@ -182,8 +157,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Отправь PDF или TXT файл, я:\n"
             "• Найду подводные камни\n"
             "• Укажу на незаконные пункты\n"
-            "• Дам рекомендации\n\n"
-            "Или отправь фото документа 📸",
+            "• Дам рекомендации",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="back")]])
         )
 
@@ -233,54 +207,20 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=keyboard)
 
     except httpx.HTTPStatusError as e:
-        await update.message.reply_text(f"⚠️ Ошибка {e.response.status_code}:\n{e.response.text[:500]}")
+        await update.message.reply_text(f"⚠️ Ошибка {e.response.status_code}:\n{e.response.text[:300]}")
     except Exception as error:
         print(f"Ошибка reply: {error}")
         await update.message.reply_text("⚠️ Что-то пошло не так, попробуй позже.")
 
 
 # ──────────────────────────────────────────
-# ГОЛОС
+# ГОЛОС — через Mistral (транскрипция через Groq Whisper если есть, иначе просим текст)
 # ──────────────────────────────────────────
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not rate_limit_check(update.effective_user.id):
-        await update.message.reply_text("⏳ Не торопись!")
-        return
-
-    msg = await update.message.reply_text("🎤 Обрабатываю голос...")
-
-    try:
-        voice_file = await update.message.voice.get_file()
-        voice_path = f"/tmp/voice_{update.effective_user.id}.ogg"
-        await voice_file.download_to_drive(voice_path)
-
-        with open(voice_path, "rb") as f:
-            audio_b64 = base64.b64encode(f.read()).decode()
-        os.remove(voice_path)
-
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            response = await client.post(
-                GEMINI_URL,
-                json={
-                    "contents": [{
-                        "role": "user",
-                        "parts": [
-                            {"inline_data": {"mime_type": "audio/ogg", "data": audio_b64}},
-                            {"text": "Транскрибируй это аудио на русском языке. Только текст, без пояснений."}
-                        ]
-                    }]
-                }
-            )
-            response.raise_for_status()
-            text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-        await msg.edit_text(f"📝 Ты сказал: *{text}*\n\nОтвечаю...", parse_mode="Markdown")
-        update.message.text = text
-        await reply(update, context)
-
-    except Exception as error:
-        print(f"Ошибка голоса: {error}")
-        await msg.edit_text("⚠️ Не смог распознать голос, напиши текстом.")
+    await update.message.reply_text(
+        "🎤 Голосовые сообщения пока не поддерживаются.\n"
+        "Напиши вопрос текстом! ✍️"
+    )
 
 
 # ──────────────────────────────────────────
@@ -323,24 +263,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ФОТО
 # ──────────────────────────────────────────
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("📸 Анализирую фото...")
-
-    try:
-        photo      = update.message.photo[-1]
-        photo_file = await photo.get_file()
-        photo_path = f"/tmp/photo_{update.effective_user.id}.jpg"
-        await photo_file.download_to_drive(photo_path)
-
-        with open(photo_path, "rb") as f:
-            image_b64 = base64.b64encode(f.read()).decode()
-        os.remove(photo_path)
-
-        result = await analyze_image_gemini(image_b64)
-        await msg.edit_text(f"📋 Анализ фото:\n\n{result}")
-
-    except Exception as error:
-        print(f"Ошибка фото: {error}")
-        await msg.edit_text(f"⚠️ Ошибка: {error}")
+    await update.message.reply_text(
+        "📸 Для анализа фото отправь документ в формате PDF или TXT.\n"
+        "Или перепиши текст вручную."
+    )
 
 
 # ──────────────────────────────────────────
@@ -357,7 +283,7 @@ def main():
     bot.add_handler(MessageHandler(filters.PHOTO,        handle_photo))
     bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
 
-    print("✅ Сократ запущен на Gemini!")
+    print("✅ Сократ запущен на Mistral!")
     bot.run_polling(drop_pending_updates=True)
 
 
